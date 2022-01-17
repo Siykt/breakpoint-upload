@@ -6,11 +6,8 @@ import ComputeHashWorker from 'worker-loader!./computeHash.worker';
 import axios, { AxiosResponse } from 'axios';
 import { UploadResponse } from '@breakpoint-upload/api-interfaces';
 import { throttle } from 'lodash';
-
-const log: <T>(data: T) => T = (data) => {
-  console.log('data ->', data);
-  return data;
-};
+import { concurrentFetch, log } from '../../utils';
+import { DEFAULT_BREAKPOINT_CHUNK_SIZE } from '../constants';
 
 const { Paragraph, Text } = Typography;
 
@@ -34,41 +31,44 @@ interface BreakpointFileUploadProps {
 }
 
 const STATUS = ['未开始', '已成功', '已失败', '暂停中'];
-export type ChunkInfo = { blob: Blob };
 
 export default function BreakpointFileUpload({ breakpointSize }: BreakpointFileUploadProps) {
-  const DEFAULT_BREAKPOINT_SIZE = useMemo(() => 1024 ** 2, []);
-
   // 处理 breakpointSize 为零或为空的情况
-  breakpointSize = breakpointSize || DEFAULT_BREAKPOINT_SIZE;
+  breakpointSize = breakpointSize || DEFAULT_BREAKPOINT_CHUNK_SIZE;
 
   const fileRef = useRef<HTMLInputElement>();
   const [hash, setHash] = useState('');
   const [size, setSize] = useState(0);
   const [fileName, setFileName] = useState('');
   const [isNormal, setIsNormal] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File>();
+  const [chunksLength, setChunksLength] = useState(0);
   const [isComputingHash, setIsComputingHash] = useState(false);
-  const [fileChunks, setFileChunks] = useState<ChunkInfo[]>([]);
   const [uploadStatusMap, setUploadStatusMap] = useState<{ [x: number]: number }>({});
   const [isUploading, setIsUploading] = useState(false);
   const [uploadedPercentage, setUploadedPercentage] = useState(0);
   const [hashComputePercentage, setHashComputePercentage] = useState(0);
   const sizeStr = useMemo(() => formatBitSize(size), [size]);
   const breakpointSizeStr = useMemo(() => formatBitSize(breakpointSize), [breakpointSize]);
-  const dataSource = useMemo(
-    () =>
-      Array(fileChunks.length)
+  const getStatusText = useCallback((status: number) => STATUS[status || 0], []);
+  const dataSource = useMemo(() => {
+    if (chunksLength) {
+      const list = Array(chunksLength)
         .fill(0)
         .map((_, index) => ({
           index,
           hash: hash ? `${hash}_${index}` : '未计算',
-          size: fileChunks.length - index === -1 ? breakpointSize : size % breakpointSize,
+          size: breakpointSize,
           status: uploadStatusMap[index],
-        })),
-    [fileChunks.length, hash, uploadStatusMap, breakpointSize, size]
-  );
+        }));
+
+      list[list.length - 1].size = size % breakpointSize ? size % breakpointSize : breakpointSize;
+      return list;
+    }
+    return [];
+  }, [chunksLength, hash, uploadStatusMap, breakpointSize, size]);
+
   const columnRender = (text: string) => <Text>{text}</Text>;
-  const getStatusText = useCallback((status: number) => STATUS[status || 0], []);
   const columns = [
     {
       title: '下标',
@@ -98,13 +98,11 @@ export default function BreakpointFileUpload({ breakpointSize }: BreakpointFileU
         {!isNormal && (
           <>
             <Text type="secondary">hash计算进度</Text>
-            <Progress className="ml10" percent={Math.floor(hashComputePercentage)} />
-            <Text type="secondary" className="ml10">
-              上传进度条
-            </Text>
+            <Progress percent={Math.floor(hashComputePercentage)} />
+            <Text type="secondary">上传进度条</Text>
           </>
         )}
-        <Progress className="ml10" percent={Math.floor(uploadedPercentage)} />
+        <Progress percent={Math.floor(uploadedPercentage)} />
       </Paragraph>
     ),
     [hashComputePercentage, isNormal, uploadedPercentage]
@@ -133,35 +131,19 @@ export default function BreakpointFileUpload({ breakpointSize }: BreakpointFileU
 
     const fileSize = file.size;
 
+    setUploadFile(file);
+    setChunksLength(log(Math.ceil(fileSize / breakpointSize)));
+
     // 重置与文件hash相关的视图
     setHash('');
     setIsUploading(false);
     setUploadedPercentage(0);
     setHashComputePercentage(0);
     setUploadStatusMap({});
-    setFileChunks([]);
 
     if (fileSize > breakpointSize) {
       // 启用切片模式
-      const fileChunk: ChunkInfo[] = [];
-      for (let cur = 0; cur < fileSize; cur += breakpointSize) {
-        fileChunk.push({ blob: file.slice(cur, cur + breakpointSize) });
-      }
       setIsNormal(false);
-      setFileChunks(fileChunk);
-
-      // 计算 hash 的 Web Worker
-      const computeHashWorker = new ComputeHashWorker();
-      computeHashWorker.onmessage = (event: MessageEvent<{ percentage: number; hash?: string }>) => {
-        const { percentage, hash } = event.data;
-
-        throttle(setHashComputePercentage, 100)(percentage);
-        if (hash) {
-          setHash(hash);
-          computeHashWorker.terminate();
-        }
-      };
-      computeHashWorker.postMessage(fileChunk);
     } else {
       // 启用正常模式
       setIsNormal(true);
@@ -172,40 +154,54 @@ export default function BreakpointFileUpload({ breakpointSize }: BreakpointFileU
 
   // 上传事件
   const handleUpload = async () => {
-    if (!size || (!isNormal && !fileChunks.length)) {
+    if (!uploadFile || !size || (!isNormal && !chunksLength)) {
       message.error('请先选择文件!');
       return;
     }
-    if (isComputingHash) {
-      message.error('请等待hash计算完成!');
-      return;
-    }
+
     setIsUploading(true);
+
     if (isNormal) {
       // await axios.post('/api/');
     } else {
-      const taskList: Promise<AxiosResponse<UploadResponse>>[] = [];
-      for (const [index, { blob }] of Object.entries(fileChunks)) {
+      // 计算 hash 的 WebWorker
+      const computeHashWorker = new ComputeHashWorker();
+      const taskList: ((index: number) => Promise<AxiosResponse<UploadResponse>>)[] = [];
+      const awaitHashComputed = new Promise<void>((resolve) => {
+        computeHashWorker.onmessage = (event: MessageEvent<{ percentage: number; hash?: string }>) => {
+          const { percentage, hash } = event.data;
+
+          setHashComputePercentage(percentage);
+
+          if (hash) {
+            setHash(hash);
+            setIsComputingHash(false);
+            computeHashWorker.terminate();
+            resolve();
+          }
+        };
+      });
+
+      computeHashWorker.postMessage(uploadFile);
+
+      await awaitHashComputed;
+
+      for (let cur = 0, index = 0; cur < size; cur += breakpointSize) {
+        const chunk = uploadFile.slice(cur, cur + breakpointSize);
         const formData = new FormData();
-        formData.append('chunk', blob);
+        formData.append('chunk', chunk);
         formData.append('fileName', fileName);
-        formData.append('hash', `${hash}_${index}`);
-        taskList.push(
-          new Promise((resolve, reject) =>
-            axios
-              .post<UploadResponse>('/api/upload/breakpoint', formData)
-              .then((res) => {
-                setUploadedPercentage((percentage) => log(percentage + 100 / fileChunks.length));
-                setUploadStatusMap((uploadStatusMap) => ({ ...uploadStatusMap, [index]: res.data.data.status }));
-                resolve(res);
-              })
-              .catch(reject)
-          )
-        );
+        formData.append('hash', `${hash}_${index++}`);
+        taskList.push(async (index) => {
+          const res = await axios.post<UploadResponse>('/api/upload/breakpoint', formData);
+          setUploadedPercentage((percentage) => log(percentage + 100 / chunksLength));
+          setUploadStatusMap((uploadStatusMap) => ({ ...uploadStatusMap, [index]: res.data.data.status }));
+          return res;
+        });
       }
 
       try {
-        const res = await Promise.all(taskList);
+        const res = await concurrentFetch(taskList);
         if (res.some(({ data }) => data.code !== 200)) {
           throw new Error('部分文件上传失败');
         }
@@ -265,7 +261,7 @@ export default function BreakpointFileUpload({ breakpointSize }: BreakpointFileU
         <Button onClick={handleChooseFile} icon={<FileAddOutlined />}>
           选择文件
         </Button>
-        <Button className="ml10" icon={<UploadOutlined />} type="primary" onClick={handleUpload}>
+        <Button className="ml10" icon={<UploadOutlined />} type="primary" onClick={handleUpload} loading={isUploading}>
           上传
         </Button>
         <Button className="ml10" icon={<PauseOutlined />} onClick={handlePaused}>
