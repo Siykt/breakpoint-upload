@@ -1,4 +1,6 @@
 import SparkMD5 from 'spark-md5';
+import { log } from '../../utils';
+import { AwaitDone } from '../../utils/AwaitDone';
 import { DEFAULT_BREAKPOINT_CHUNK_SIZE } from '../constants';
 
 function calculateHashSample(file: File) {
@@ -24,12 +26,27 @@ export interface ComputedInfoMessage {
   hash?: string;
 }
 
+let isPaused = false;
+
+const Sleep = new AwaitDone();
+
 // eslint-disable-next-line
 const ctx: Worker = self as any;
 
-ctx.onmessage = (e: MessageEvent<Blob[] | File>) => {
+export type ComputeEntryMessage = MessageEvent<Blob[] | File | -1 | 1>;
+export type ComputeMessageEvent = MessageEvent<{ percentage: number; hash?: string }>;
+
+ctx.onmessage = (e: ComputeEntryMessage) => {
   const { data } = e;
   let chunks: Blob[];
+
+  if (data === -1) {
+    isPaused = true;
+    return;
+  } else if (data === 1) {
+    Sleep.release();
+    return;
+  }
 
   if (Array.isArray(data)) {
     chunks = data;
@@ -38,24 +55,29 @@ ctx.onmessage = (e: MessageEvent<Blob[] | File>) => {
   }
 
   const spark = new SparkMD5.ArrayBuffer();
-  let percentage = 0;
   let computedCount = 0;
 
   // 读取内容计算 hash 值
-  const load = (event: ProgressEvent<FileReader>) => {
+  const load = async (event: ProgressEvent<FileReader>) => {
     if (typeof event.target.result !== 'string') {
       spark.append(event.target.result);
     } else {
       throw new TypeError('LoadEventError, 无法获取字符串数据');
     }
-    percentage += 100 / chunks.length;
+
+    // 暂停时等待
+    if (isPaused) {
+      await Sleep.start();
+    }
+
     if (++computedCount === chunks.length) {
       const hash = spark.end();
       ctx.postMessage({ percentage: 100, hash });
 
       spark.reset();
+      spark.destroy();
     } else {
-      ctx.postMessage({ percentage });
+      ctx.postMessage({ percentage: 100 / chunks.length });
     }
   };
 
